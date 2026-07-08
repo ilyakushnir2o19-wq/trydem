@@ -1,0 +1,8 @@
+# Зависимости бота Liquidity Trap v2
+# numpy жёстко <2.0 — pandas_ta 0.3.14b0 несовместим с numpy 2.x
+numpy<2
+pandas>=2.0,<3
+pandas_ta==0.3.14b0
+ccxt>=4.3.0
+python-telegram-bot>=21.0
+setuptools>=65.0
