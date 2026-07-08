@@ -73,11 +73,11 @@ CONFIG = {
     "SIGNAL_COOLDOWN_CANDLES": 3,
 
     # --- Ключи ---
-    "OKX_API_KEY": os.getenv("OKX_API_KEY", ""),
-    "OKX_API_SECRET": os.getenv("OKX_API_SECRET", ""),
-    "OKX_API_PASSPHRASE": os.getenv("OKX_API_PASSPHRASE", ""),
-    "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
-    "TG_CHAT_ID": os.getenv("TG_CHAT_ID", ""),
+    "OKX_API_KEY": os.getenv("OKX_API_KEY", "ff2096ce-c6c3-480f-8e9c-1967f40992ad"),
+    "OKX_API_SECRET": os.getenv("OKX_API_SECRET", "B97AFC64D3DF87E796212C1594287A07"),
+    "OKX_API_PASSPHRASE": os.getenv("OKX_API_PASSPHRASE", "Ataman4825!"),
+    "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", "8484342686:AAF4Dr05pu2NHFqgDHAC0Iy2C1dBGee86r4"),
+    "TG_CHAT_ID": os.getenv("TG_CHAT_ID", "7413242280"),
     "FALLBACK_BALANCE_USDT": 200.0,
 }
 
