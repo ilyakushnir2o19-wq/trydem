@@ -1,19 +1,21 @@
 """
-OKX Liquidity Trap Bot v3.0 — Multi-Coin Scanner (READ-ONLY)
+OKX Liquidity Trap Bot v3.1 — Multi-Coin Scanner (READ-ONLY)
 ============================================================
 Стратегия: снятие ликвидности (sweep свинг-экстремума) + хвост >= 50% +
-закрытие обратно за EMA20/VWAP + объём + фильтр тренда 1h + скоринг.
+объём + закрытие обратно за снятым уровнем; EMA20/VWAP/тренд 1h — баллы.
 
-НОВОЕ В 3.0:
-  - МУЛЬТИСКАНЕР: бот следит не за одной парой, а за TOP_N_SYMBOLS
-    самых ликвидных USDT-свопов OKX (по обороту за 24ч).
-    Список обновляется автоматически раз в SYMBOL_REFRESH_MIN минут.
-  - Режим STATIC: можно задать свой фиксированный список монет.
-  - Кэш тренда 1h на 10 минут (EMA200 меняется медленно) — меньше
-    запросов к бирже, нет упора в rate-limit.
-  - Пер-символьные кулдауны и защита от дублей.
-  - /status показывает сводку по всем монетам.
-  - Динамическое форматирование цен (BTC 65432.10, PEPE 0.00001234).
+НОВОЕ В 3.1 (исправление главного бага "нет сигналов"):
+  - Требование закрыться за EMA20 И VWAP одновременно было ОБЯЗАТЕЛЬНЫМ
+    и отсекало почти все реальные ловушки. Теперь обязательное ядро:
+    sweep + хвост + объём + закрытие обратно за СНЯТЫМ уровнем (6 баллов),
+    а EMA20 (+1), VWAP (+1), сильный объём (+1), тренд 1h (+2),
+    контекст (+1) — бонусы. Порог MIN_SCORE_TO_SEND=6 теперь реально
+    пропускает базовые сетапы; 8-9 — сбалансированно; 11+ — только элита.
+  - Журнал "почти-сигналов": /status показывает, какие сетапы бот видел
+    и по какой причине отбраковал (мал хвост / мал объём / нет отказа).
+
+НОВОЕ В 3.0: мультисканер топ-N ликвидных USDT-свопов OKX (auto/static),
+кэш тренда 1h, пер-символьные кулдауны, /start /status /ping.
 
 Бот НЕ торгует. Только сигналы в Telegram.
 
@@ -28,6 +30,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 import ccxt.async_support as ccxt
@@ -40,15 +43,21 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 CONFIG = {
     # --- Выбор монет ---
     "SYMBOLS_MODE": "auto",        # "auto" = топ по обороту | "static" = свой список
-    "TOP_N_SYMBOLS": 15,           # сколько монет сканировать в режиме auto
+    "TOP_N_SYMBOLS": 30,           # сколько монет сканировать в режиме auto
     "STATIC_SYMBOLS": [            # используется в режиме static или как fallback
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT",
         "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
         "LTC/USDT:USDT", "DOT/USDT:USDT", "TON/USDT:USDT", "SUI/USDT:USDT",
         "OP/USDT:USDT", "ARB/USDT:USDT", "PEPE/USDT:USDT",
     ],
+    # Не-криптовалютные и суррогатные инструменты — вне стратегии:
+    "EXCLUDE_BASES": {"XPD", "XPT", "XAU", "XAG", "USDC", "DAI", "EURT"},
     "SYMBOL_REFRESH_MIN": 60,      # как часто обновлять топ-список (мин)
     "MIN_24H_VOLUME_USDT": 20_000_000,  # отсечка неликвида в режиме auto
+
+    # --- Часовой пояс для сообщений ---
+    "TZ_OFFSET_HOURS": 3,          # МСК = UTC+3
+    "TZ_LABEL": "МСК",
 
     # --- Таймфреймы ---
     "TIMEFRAME": "5m",
@@ -61,19 +70,24 @@ CONFIG = {
     "EMA_PERIOD": 20,
     "VOL_SMA_PERIOD": 20,
     "WICK_MIN_RATIO": 0.50,
-    "VOL_MULTIPLIER": 1.5,
-    "VOL_STRONG_MULT": 2.5,
+    "VOL_MULTIPLIER": 1.3,         # мин. объём односвечной ловушки (было 1.5)
+    "VOL_STRONG_MULT": 2.2,        # "аномальный" объём (+1 балл)
     "TREND_LOOKBACK": 3,
     "SWEEP_LOOKBACK": 20,
     "HTF_EMA_PERIOD": 200,
 
-    # --- Скоринг (обязательный минимум 8, максимум 12) ---
-    "MIN_SCORE_TO_SEND": 9,
+    # --- Двухсвечная ловушка (свеча 1 прокалывает, свеча 2 подтверждает) ---
+    "TWO_CANDLE_ENABLED": True,
+    "TWO_CANDLE_VOL_MULT": 1.3,    # объём хотя бы одной из двух свечей >= x1.3
 
-    # --- Стопы ---
+    # --- Скоринг: 5-6 = базовые сетапы, 8 = сбалансированно, 11+ = элита ---
+    "MIN_SCORE_TO_SEND": 6,
+    "SEND_NEAR_MISSES": True,      # слать короткие "👀 наблюдение" о почти-сигналах
+
+    # --- Стопы и цели ---
     "ATR_PERIOD": 14,
     "ATR_STOP_MULT": 0.25,
-    "RR_RATIO": 2.0,
+    "RR_RATIO": 2.0,               # TP2; TP1 всегда = 1R (фиксация 50% + стоп в БУ)
 
     # --- Риск и плечо ---
     "RISK_PER_TRADE": 0.03,
@@ -83,7 +97,7 @@ CONFIG = {
     "MMR": 0.005,
 
     # --- Фильтр времени (UTC), None = всегда ---
-    "TRADING_HOURS_UTC": range(6, 22),
+    "TRADING_HOURS_UTC": range(none),
 
     # --- Цикл ---
     "CHECK_INTERVAL_SEC": 60,
@@ -113,12 +127,24 @@ STATE = {
     "symbols": [],                 # активный список монет
     "per_symbol": {},              # symbol -> {"close":..,"trend":..,"vol_x":..}
     "signals_sent": 0,
+    "setups_seen": 0,              # сколько раз ядро ловушки (sweep+хвост) замечено
+    "near_misses": deque(maxlen=8),  # последние почти-сигналы с причинами отказа
     "last_signal_text": None,
     "last_error": None,
 }
 
 
 # ==================== ВСПОМОГАТЕЛЬНОЕ =============================
+
+def fmt_time(dt_utc) -> str:
+    """UTC -> локальное время сообщений (по умолчанию МСК = UTC+3)."""
+    local = dt_utc + pd.Timedelta(hours=CONFIG["TZ_OFFSET_HOURS"])
+    return f"{local.strftime('%d.%m %H:%M')} {CONFIG['TZ_LABEL']}"
+
+
+def now_local_str() -> str:
+    return fmt_time(pd.Timestamp.now(tz="UTC"))
+
 
 def fmt_price(p: float) -> str:
     """Динамическая точность: BTC 65,432.10, SOL 145.2, PEPE 0.00001234."""
@@ -149,7 +175,11 @@ async def fetch_df(exchange: ccxt.okx, symbol: str, timeframe: str,
 
 
 async def fetch_top_symbols(exchange: ccxt.okx) -> list[str]:
-    """Топ-N USDT-свопов OKX по обороту за 24ч (режим auto)."""
+    """Топ-N USDT-свопов OKX по обороту за 24ч (режим auto).
+
+    ВАЖНО: оборот считаем по нативному полю OKX volCcy24h (объём в базовой
+    монете) * last. Поле quoteVolume из ccxt для свопов OKX ненадёжно —
+    из-за него в топ попадали палладий (XPD) и платина (XPT)."""
     if CONFIG["SYMBOLS_MODE"] != "auto":
         return list(CONFIG["STATIC_SYMBOLS"])
     try:
@@ -158,23 +188,31 @@ async def fetch_top_symbols(exchange: ccxt.okx) -> list[str]:
             s for s, m in markets.items()
             if m.get("swap") and m.get("settle") == "USDT"
             and m.get("quote") == "USDT" and m.get("active", True)
+            and m.get("base") not in CONFIG["EXCLUDE_BASES"]
         ]
         tickers = await exchange.fetch_tickers(swap_symbols)
 
         def turnover(t: dict) -> float:
+            last = t.get("last") or 0.0
+            info = t.get("info") or {}
+            vol_base = info.get("volCcy24h")          # нативное поле OKX
+            if vol_base and last:
+                return float(vol_base) * float(last)
             qv = t.get("quoteVolume")
             if qv:
                 return float(qv)
-            bv, lp = t.get("baseVolume"), t.get("last")
-            return float(bv) * float(lp) if bv and lp else 0.0
+            bv = t.get("baseVolume")
+            return float(bv) * float(last) if bv and last else 0.0
 
         ranked = sorted(tickers.values(), key=turnover, reverse=True)
-        top = [t["symbol"] for t in ranked
+        top = [(t["symbol"], turnover(t)) for t in ranked
                if turnover(t) >= CONFIG["MIN_24H_VOLUME_USDT"]]
         top = top[:CONFIG["TOP_N_SYMBOLS"]]
         if not top:
             raise ValueError("пустой топ-список")
-        return top
+        log.info("Топ по обороту 24ч: %s",
+                 ", ".join(f"{s.split('/')[0]}({v/1e6:.0f}M)" for s, v in top[:10]))
+        return [s for s, _ in top]
     except Exception as e:
         log.error("Не удалось получить топ монет (%s) — статический список.", e)
         return list(CONFIG["STATIC_SYMBOLS"])[:CONFIG["TOP_N_SYMBOLS"]]
@@ -254,12 +292,41 @@ def htf_trend(df_htf: pd.DataFrame) -> str:
 
 # ====================== ЛОГИКА СТРАТЕГИИ ==========================
 
-def analyze(df: pd.DataFrame, trend_1h: str) -> dict | None:
+_NEAR_SEEN: dict[str, int] = {}   # symbol -> ts свечи последнего учтённого почти-сигнала
+
+
+def _log_near_miss(symbol: str, side: str, candle, reasons: list[str]) -> None:
+    """Запоминаем 'почти-сигнал' для /status: ядро ловушки было, но что-то не добрало.
+    Одна и та же свеча учитывается один раз (цикл опрашивает её многократно)."""
+    ts = int(candle["timestamp"])
+    if _NEAR_SEEN.get(symbol) == ts:
+        return
+    _NEAR_SEEN[symbol] = ts
+    STATE["setups_seen"] += 1
+    STATE["near_misses"].appendleft({
+        "symbol": symbol, "side": side,
+        "time": candle["dt"].strftime("%m-%d %H:%M"),
+        "reasons": ", ".join(reasons),
+    })
+    log.info("Почти-сигнал %s %s: %s", symbol, side, ", ".join(reasons))
+
+
+def analyze(df: pd.DataFrame, trend_1h: str, symbol: str = "?") -> dict | None:
     """
-    Скоринг последней закрытой свечи (макс. 12):
-      sweep свинг-экстремума +3 | хвост >=50% +2 | закрытие за EMA и VWAP +2
-      объём >=1.5x +1 (>=2.5x +2) | тренд 1h в сторону сделки +2 | контекст 5m +1
-    Первые четыре условия обязательны.
+    Скоринг последней закрытой свечи. v3.1: EMA/VWAP переведены из
+    обязательных условий в баллы — раньше требование закрыться за
+    EMA20 И VWAP одновременно отсекало почти все реальные ловушки
+    (после снятия лоу дневной VWAP часто слишком далеко от цены).
+
+    ОБЯЗАТЕЛЬНО (ядро ловушки, базовые 6 баллов):
+      sweep свинг-экстремума ................. +3
+      хвост >= WICK_MIN_RATIO ................ +2
+      объём >= 1.5x .......................... +1
+      закрытие ОБРАТНО за снятым уровнем ..... (фильтр, без баллов)
+    БОНУСЫ (до 12):
+      закрытие за EMA20 +1 | за VWAP +1 | объём >= 2.5x +1
+      тренд 1h в сторону сделки +2 | контекст 5m +1
+    Градации: 11-12 = A+, 9-10 = A, 6-8 = B.
     """
     lb = CONFIG["TREND_LOOKBACK"]
     need = CONFIG["SWEEP_LOOKBACK"] + CONFIG["EMA_PERIOD"] + lb + 2
@@ -282,41 +349,148 @@ def analyze(df: pd.DataFrame, trend_1h: str) -> dict | None:
     upper_wick = (last["high"] - body_top) / rng
     lower_wick = (body_bot - last["low"]) / rng
     vol_x = last["volume"] / last["vol_sma"] if last["vol_sma"] > 0 else 0.0
+    vol_ok = vol_x >= CONFIG["VOL_MULTIPLIER"]
+    vol_strong = vol_x >= CONFIG["VOL_STRONG_MULT"]
 
-    def volume_score() -> int:
-        if vol_x >= CONFIG["VOL_STRONG_MULT"]:
-            return 2
-        if vol_x >= CONFIG["VOL_MULTIPLIER"]:
-            return 1
-        return 0
-
-    # ------------------------- SHORT -------------------------
+    # ------------------------- SHORT (1 свеча) ---------------
     sweep_hi = last["high"] > last["swing_high"]
-    reject_dn = last["close"] < last["vwap"] and last["close"] < last["ema20"]
     wick_up_ok = upper_wick >= CONFIG["WICK_MIN_RATIO"]
-    ctx_up = ((prev["close"] > prev["ema20"]) & (prev["close"] > prev["vwap"])).all()
 
-    if sweep_hi and wick_up_ok and reject_dn and volume_score() >= 1:
-        score = 3 + 2 + 2 + volume_score()
-        score += 2 if trend_1h == "down" else 0
-        score += 1 if ctx_up else 0
-        return {"side": "SHORT", "candle": last, "vol_x": vol_x,
-                "score": score, "trend_1h": trend_1h,
-                "swept": float(last["swing_high"])}
+    if sweep_hi and (wick_up_ok or vol_ok):        # ядро замечено — диагностируем
+        back_inside = last["close"] < last["swing_high"]   # отказ: закрытие под снятым хаем
+        if wick_up_ok and vol_ok and back_inside:
+            score = 6
+            score += 1 if last["close"] < last["ema20"] else 0
+            score += 1 if last["close"] < last["vwap"] else 0
+            score += 1 if vol_strong else 0
+            score += 2 if trend_1h == "down" else 0
+            ctx_up = ((prev["close"] > prev["ema20"]) &
+                      (prev["close"] > prev["vwap"])).all()
+            score += 1 if ctx_up else 0
+            return {"side": "SHORT", "candle": last, "vol_x": vol_x,
+                    "score": score, "trend_1h": trend_1h,
+                    "swept": float(last["swing_high"]),
+                    "pattern": "1-свечная",
+                    "stop_high": float(last["high"]),
+                    "stop_low": float(last["low"])}
+        two = _two_candle(df, trend_1h, symbol)
+        if two:
+            return two
+        reasons = []
+        if not wick_up_ok:
+            reasons.append(f"хвост {upper_wick*100:.0f}%<{CONFIG['WICK_MIN_RATIO']*100:.0f}%")
+        if not vol_ok:
+            reasons.append(f"объём x{vol_x:.1f}<{CONFIG['VOL_MULTIPLIER']}")
+        if not back_inside:
+            reasons.append("закрылась выше снятого хая (жду свечу-подтверждение)")
+        _log_near_miss(symbol, "SHORT", last, reasons)
+        return None
 
-    # ------------------------- LONG --------------------------
+    # ------------------------- LONG (1 свеча) ----------------
     sweep_lo = last["low"] < last["swing_low"]
-    reject_up = last["close"] > last["vwap"] and last["close"] > last["ema20"]
     wick_dn_ok = lower_wick >= CONFIG["WICK_MIN_RATIO"]
-    ctx_dn = ((prev["close"] < prev["ema20"]) & (prev["close"] < prev["vwap"])).all()
 
-    if sweep_lo and wick_dn_ok and reject_up and volume_score() >= 1:
-        score = 3 + 2 + 2 + volume_score()
+    if sweep_lo and (wick_dn_ok or vol_ok):
+        back_inside = last["close"] > last["swing_low"]    # отказ: закрытие над снятым лоу
+        if wick_dn_ok and vol_ok and back_inside:
+            score = 6
+            score += 1 if last["close"] > last["ema20"] else 0
+            score += 1 if last["close"] > last["vwap"] else 0
+            score += 1 if vol_strong else 0
+            score += 2 if trend_1h == "up" else 0
+            ctx_dn = ((prev["close"] < prev["ema20"]) &
+                      (prev["close"] < prev["vwap"])).all()
+            score += 1 if ctx_dn else 0
+            return {"side": "LONG", "candle": last, "vol_x": vol_x,
+                    "score": score, "trend_1h": trend_1h,
+                    "swept": float(last["swing_low"]),
+                    "pattern": "1-свечная",
+                    "stop_high": float(last["high"]),
+                    "stop_low": float(last["low"])}
+        two = _two_candle(df, trend_1h, symbol)
+        if two:
+            return two
+        reasons = []
+        if not wick_dn_ok:
+            reasons.append(f"хвост {lower_wick*100:.0f}%<{CONFIG['WICK_MIN_RATIO']*100:.0f}%")
+        if not vol_ok:
+            reasons.append(f"объём x{vol_x:.1f}<{CONFIG['VOL_MULTIPLIER']}")
+        if not back_inside:
+            reasons.append("закрылась ниже снятого лоу (жду свечу-подтверждение)")
+        _log_near_miss(symbol, "LONG", last, reasons)
+        return None
+
+    # Односвечного ядра нет — проверяем двухсвечный вариант
+    return _two_candle(df, trend_1h, symbol)
+
+
+def _two_candle(df: pd.DataFrame, trend_1h: str, symbol: str) -> dict | None:
+    """
+    ДВУХСВЕЧНАЯ ЛОВУШКА: свеча A прокалывает экстремум и закрывается ЗА ним
+    (ложный пробой без мгновенного отказа), свеча B (последняя) закрывается
+    ОБРАТНО внутри диапазона — отказ пришёл со второй свечой.
+    Это тот самый случай "закрылась ниже снятого лоу" из журнала почти-сигналов.
+
+    Обязательно: прокол A + возврат B в сторону сделки + объём (A или B) >= x1.3.
+    База 5 баллов (чуть слабее односвечной), бонусы те же, максимум 11.
+    """
+    if not CONFIG["TWO_CANDLE_ENABLED"] or len(df) < CONFIG["SWEEP_LOOKBACK"] + 25:
+        return None
+
+    a = df.iloc[-2]
+    b = df.iloc[-1]
+    lb = CONFIG["TREND_LOOKBACK"]
+    prev = df.iloc[-2 - lb:-2]          # контекст ДО свечи-прокола
+
+    cols = ["ema20", "vwap", "vol_sma", "atr", "swing_high", "swing_low"]
+    if a[cols].isna().any() or b[cols].isna().any():
+        return None
+    if a["vol_sma"] <= 0:
+        return None
+
+    vol_a = a["volume"] / a["vol_sma"]
+    vol_b = b["volume"] / b["vol_sma"] if b["vol_sma"] > 0 else 0.0
+    vol_pair_ok = max(vol_a, vol_b) >= CONFIG["TWO_CANDLE_VOL_MULT"]
+    vol_x = max(vol_a, vol_b)
+    vol_strong = vol_x >= CONFIG["VOL_STRONG_MULT"]
+
+    # ---- SHORT: A проколола хай и закрылась выше, B закрылась обратно ниже
+    level_hi = float(a["swing_high"])
+    if (a["high"] > level_hi and a["close"] > level_hi
+            and b["close"] < level_hi and b["close"] < b["open"]
+            and vol_pair_ok):
+        score = 5
+        score += 1 if b["close"] < b["ema20"] else 0
+        score += 1 if b["close"] < b["vwap"] else 0
+        score += 1 if vol_strong else 0
+        score += 2 if trend_1h == "down" else 0
+        ctx_up = ((prev["close"] > prev["ema20"]) &
+                  (prev["close"] > prev["vwap"])).all()
+        score += 1 if ctx_up else 0
+        return {"side": "SHORT", "candle": b, "vol_x": vol_x,
+                "score": score, "trend_1h": trend_1h, "swept": level_hi,
+                "pattern": "2-свечная",
+                "stop_high": float(max(a["high"], b["high"])),
+                "stop_low": float(min(a["low"], b["low"]))}
+
+    # ---- LONG: A проколола лоу и закрылась ниже, B закрылась обратно выше
+    level_lo = float(a["swing_low"])
+    if (a["low"] < level_lo and a["close"] < level_lo
+            and b["close"] > level_lo and b["close"] > b["open"]
+            and vol_pair_ok):
+        score = 5
+        score += 1 if b["close"] > b["ema20"] else 0
+        score += 1 if b["close"] > b["vwap"] else 0
+        score += 1 if vol_strong else 0
         score += 2 if trend_1h == "up" else 0
+        ctx_dn = ((prev["close"] < prev["ema20"]) &
+                  (prev["close"] < prev["vwap"])).all()
         score += 1 if ctx_dn else 0
-        return {"side": "LONG", "candle": last, "vol_x": vol_x,
-                "score": score, "trend_1h": trend_1h,
-                "swept": float(last["swing_low"])}
+        return {"side": "LONG", "candle": b, "vol_x": vol_x,
+                "score": score, "trend_1h": trend_1h, "swept": level_lo,
+                "pattern": "2-свечная",
+                "stop_high": float(max(a["high"], b["high"])),
+                "stop_low": float(min(a["low"], b["low"]))}
 
     return None
 
@@ -338,13 +512,18 @@ def build_trade_plan(signal: dict, balance: float) -> dict:
     rr = CONFIG["RR_RATIO"]
     lev = CONFIG["LEVERAGE"]
 
+    stop_high = signal.get("stop_high", float(c["high"]))
+    stop_low = signal.get("stop_low", float(c["low"]))
+
     if signal["side"] == "SHORT":
-        stop = float(c["high"]) + atr_buf
+        stop = stop_high + atr_buf
         risk_per_unit = stop - entry
-        take = entry - risk_per_unit * rr
+        tp1 = entry - risk_per_unit           # 1R: фиксация 50%, стоп в БУ
+        take = entry - risk_per_unit * rr     # 2R: основная цель
     else:
-        stop = float(c["low"]) - atr_buf
+        stop = stop_low - atr_buf
         risk_per_unit = entry - stop
+        tp1 = entry + risk_per_unit
         take = entry + risk_per_unit * rr
 
     stop_pct = risk_per_unit / entry
@@ -367,7 +546,7 @@ def build_trade_plan(signal: dict, balance: float) -> dict:
     liq_safe = liq < stop if signal["side"] == "LONG" else liq > stop
 
     return {
-        "entry": entry, "stop": stop, "take": take,
+        "entry": entry, "stop": stop, "tp1": tp1, "take": take,
         "stop_pct": stop_pct, "position_usdt": position_usdt,
         "margin": margin, "leverage": lev, "liq": liq,
         "liq_safe": liq_safe, "capped": capped,
@@ -378,7 +557,11 @@ def build_trade_plan(signal: dict, balance: float) -> dict:
 # ==================== TELEGRAM: СООБЩЕНИЯ =========================
 
 def grade(score: int) -> str:
-    return "A+ 🔥" if score >= 11 else ("A" if score >= 9 else "B")
+    if score >= 11:
+        return "A+ 🔥"
+    if score >= 9:
+        return "A"
+    return "B"
 
 
 def format_message(symbol: str, signal: dict, plan: dict) -> str:
@@ -446,10 +629,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         up = f"{d.days}д {d.seconds // 3600}ч {(d.seconds % 3600) // 60}м"
     lines = [
         "📡 Статус мультисканера",
-        f"Аптайм: {up} | Сигналов: {STATE['signals_sent']}",
+        f"Аптайм: {up} | Сигналов отправлено: {STATE['signals_sent']}",
+        f"Ядро ловушки замечено: {STATE['setups_seen']} раз "
+        f"(порог отправки: {CONFIG['MIN_SCORE_TO_SEND']}/12)",
         f"Последний цикл: {STATE['last_cycle'] or 'ещё не было'} "
         f"({STATE['cycle_sec']:.0f} сек, монет: {len(STATE['symbols'])})",
     ]
+    if STATE["near_misses"]:
+        lines.append("\nПочти-сигналы (что не добрало):")
+        for nm in list(STATE["near_misses"])[:5]:
+            coin = nm["symbol"].split("/")[0]
+            lines.append(f"• {nm['time']} {coin} {nm['side']}: {nm['reasons']}")
     if STATE["last_error"]:
         lines.append(f"⚠️ Последняя ошибка: {STATE['last_error']}")
     if STATE["per_symbol"]:
@@ -513,7 +703,7 @@ async def scan_symbol(exchange: ccxt.okx, htf: HtfCache, symbol: str,
     if int(last["timestamp"]) < runtime["cooldown"].get(symbol, 0):
         return
 
-    signal = analyze(df, trend_1h)
+    signal = analyze(df, trend_1h, symbol)
     if signal is None:
         return
     if signal["score"] < CONFIG["MIN_SCORE_TO_SEND"]:
