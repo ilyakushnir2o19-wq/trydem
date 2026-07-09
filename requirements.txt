@@ -1,5 +1,0 @@
-# Зависимости бота Liquidity Trap v2.2
-# pandas_ta удалён: недоступен для Python 3.11 на PyPI, индикаторы считаются чистым pandas
-pandas>=2.0,<3
-ccxt>=4.3.0
-python-telegram-bot>=21.0
